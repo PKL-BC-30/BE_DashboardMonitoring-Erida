@@ -1,0 +1,4 @@
+{
+    "builds": [{ "src": "src/main.rs", "use": "@vercel/rust" }]
+  }
+  
