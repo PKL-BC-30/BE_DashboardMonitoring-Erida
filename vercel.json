@@ -1,4 +1,6 @@
 {
-    "builds": [{ "src": "src/main.rs", "use": "@vercel/rust" }]
+    "builds": [
+      { "src": "Dockerfile", "use": "@vercel/docker" }
+    ]
   }
   
