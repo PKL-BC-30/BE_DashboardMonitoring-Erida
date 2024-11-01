@@ -1,21 +1,45 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use bcrypt::{hash, DEFAULT_COST};  // Import bcrypt
-use bcrypt::verify;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sqlx::{PgPool, Row};
-use dotenv::dotenv;
-use std::env;
-use lettre::{Message, SmtpTransport, Transport};
+use actix_web::{web, App, HttpServer, HttpResponse, Responder, Error as ActixError};
+use serde::{Serialize, Deserialize};
+use tokio_postgres::{NoTls, Client, Error};
+use bcrypt::{hash, verify, DEFAULT_COST};
 use lettre::transport::smtp::authentication::Credentials;
-use prettytable::{Table, row, cell};
-use rand::{thread_rng, Rng};
-use rand::distributions::Alphanumeric;
-use chrono::NaiveDateTime;
+use lettre::{Message, SmtpTransport, Transport};
+use rand::{distributions::Alphanumeric, Rng};
+use uuid::Uuid;
+use jsonwebtoken::{encode, Header, EncodingKey};
+use chrono::{Utc, Duration};
+use actix_cors::Cors;
+use serde_json::json;
+use std::collections::HashMap;
 
 
-#[derive(Serialize, Deserialize, Debug)]
-struct TypeDataPost {
+// Structs
+
+#[derive(Serialize)]
+struct ResponseMessage {
+    message: String,
+}
+
+#[derive(Serialize)]
+struct AgeCategory {
+    category_0_5: i64,
+    category_6_12: i64,
+    category_13_17: i64,
+    category_18_20: i64,
+    category_21_59: i64,
+    category_60_plus: i64,
+}
+
+
+#[derive(Serialize)]
+struct UserDetails {
+    total_users: i64,
+    male: i64,
+    female: i64,
+}
+
+#[derive(Serialize)]
+struct User {
     id: i32,
     nama_lengkap: String,
     email: String,
@@ -25,326 +49,889 @@ struct TypeDataPost {
     pekerjaan: String,
     golongan_darah: String,
     jenis_kelamin: String,
-    status: Option<String>,     
-    is_verified: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, sqlx::FromRow)]
-struct TypeDataGet {
-    id: i32,
-    nama_lengkap: String,
-    email: String,
-    password: String,
-    tanggal_lahir: String,
-    umur: i32,
-    pekerjaan: String,
-    golongan_darah: String,
-    jenis_kelamin: String,
-    status: Option<String>, 
-    is_verified: bool,
-
-}
-
-
-
-
-async fn get_users(pool: web::Data<PgPool>) -> impl Responder {
-    println!("Fetching users...");
-
-    let query = "SELECT id, nama_lengkap, email, password, tanggal_lahir, umur, pekerjaan, golongan_darah, jenis_kelamin, status, is_verified, created_at, updated_at FROM users";
-
-
-    let users: Result<Vec<TypeDataGet>, sqlx::Error> = sqlx::query_as::<_, TypeDataGet>(query)
-        .fetch_all(pool.get_ref())
-        .await;
-
-    match users {
-        Ok(users) => {
-            HttpResponse::Ok().json(users)  // Return the users as JSON
-        },
-        Err(e) => {
-            println!("Database error: {}", e);
-            HttpResponse::InternalServerError().body(format!("Database error: {}", e))
-        }
-    }
-}
-
-
-
-async fn post_users(
-    data: web::Json<TypeDataPost>,
-    pool: web::Data<PgPool>
-) -> impl Responder {
-    println!("Received data: {:?}", data);
-
-    // Encrypt the password
-    let hashed_password = match hash(&data.password, DEFAULT_COST) {
-        Ok(hashed) => hashed,
-        Err(e) => {
-            println!("Password hashing error: {}", e);
-            return HttpResponse::InternalServerError().body("Password hashing failed");
-        }
-    };
-
-    // Generate a numeric OTP
-    let otp: String = thread_rng()
-        .sample_iter(&rand::distributions::Uniform::from(0..10)) // Digits from 0 to 9
-        .take(6) // Length of OTP
-        .map(|d| char::from_digit(d, 10).unwrap())
-        .collect();
-
-    println!("Generated OTP: {}", otp);
-
-    // Send OTP via email
-    match send_email(&data.email, "Your OTP Code", &format!("Your OTP code is: {}", otp)).await {
-        Ok(_) => println!("OTP sent to {}", data.email),
-        Err(e) => {
-            println!("Failed to send OTP: {:?}", e);
-            return HttpResponse::InternalServerError().body("Failed to send OTP");
-        }
-    };
-
-    let query = "
-        INSERT INTO users (id, nama_lengkap, email, password, tanggal_lahir, umur, pekerjaan, golongan_darah, jenis_kelamin, otp, status, is_verified)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        RETURNING created_at, updated_at
-    ";
-    println!("Executing query: {}", query);
-
-    let result = sqlx::query(query)
-        .bind(data.id)
-        .bind(&data.nama_lengkap)
-        .bind(&data.email)
-        .bind(&hashed_password)  // Simpan password yang sudah di-hash
-        .bind(&data.tanggal_lahir)
-        .bind(data.umur)
-        .bind(&data.pekerjaan)
-        .bind(&data.golongan_darah)
-        .bind(&data.jenis_kelamin)
-        .bind(&otp)  // Simpan OTP yang sudah dihasilkan
-        .bind(&data.status)
-        .bind(data.is_verified)
-        .execute(pool.get_ref()).await;
-
-    match result {
-        Ok(_) => HttpResponse::Ok().json(data.into_inner()),
-        Err(e) => {
-            println!("Database error: {}", e);
-            HttpResponse::InternalServerError().body(format!("Database error: {}", e))
-        },
-    }
-}
-
-
-async fn put_user(
-    user_id: web::Path<i32>,
-    data: web::Json<TypeDataPost>,
-    pool: web::Data<PgPool>
-) -> impl Responder {
-    println!("Updating user with ID: {:?}", user_id);
-
-    // Encrypt the password
-    let hashed_password = match hash(&data.password, DEFAULT_COST) {
-        Ok(hashed) => hashed,
-        Err(e) => {
-            println!("Password hashing error: {}", e);
-            return HttpResponse::InternalServerError().body("Password hashing failed");
-        }
-    };
-
-    let query = "UPDATE users SET nama_lengkap = $1, email = $2, password = $3, tanggal_lahir = $4, umur = $5, pekerjaan = $6, golongan_darah = $7, jenis_kelamin = $8, status = $9, is_verified = $10 WHERE id = $11 RETURNING updated_at";
-
-    match sqlx::query(query)
-        .bind(&data.nama_lengkap)
-        .bind(&data.email)
-        .bind(&hashed_password)  // Simpan password yang sudah di-hash
-        .bind(&data.tanggal_lahir)
-        .bind(data.umur)
-        .bind(&data.pekerjaan)
-        .bind(&data.golongan_darah)
-        .bind(&data.jenis_kelamin)
-        .bind(&data.status)
-        .bind(&data.is_verified)
-        .bind(user_id.into_inner())
-        .execute(pool.get_ref()).await {
-            Ok(_) => {
-                println!("User updated successfully");
-                HttpResponse::Ok().json(data.into_inner())
-            },
-            Err(e) => {
-                println!("Database error: {}", e);
-                HttpResponse::InternalServerError().body(format!("Database error: {}", e))
-            },
-    }
-}
-
-async fn patch_user(
-    user_id: web::Path<i32>,
-    data: web::Json<Value>,
-    pool: web::Data<PgPool>
-) -> impl Responder {
-    println!("Patching user with ID: {:?}", user_id);
-
-    let mut query = String::from("UPDATE users SET ");
-    let mut params: Vec<String> = Vec::new();
-    let mut idx = 1;
-
-    for (key, value) in data.as_object().unwrap() {
-        if key == "password" {
-            // Handle password encryption
-            let hashed_password = match hash(value.as_str().unwrap(), DEFAULT_COST) {
-                Ok(hashed) => hashed,
-                Err(e) => {
-                    println!("Password hashing error: {}", e);
-                    return HttpResponse::InternalServerError().body("Password hashing failed");
-                }
-            };
-            params.push(hashed_password);
-        } else {
-            params.push(value.to_string());
-        }
-
-        if idx > 1 {
-            query.push_str(", ");
-        }
-        query.push_str(&format!("{} = ${}", key, idx));
-        idx += 1;
-    }
-
-    query.push_str(&format!(" WHERE id = ${}", idx));
-
-    let mut sql_query = sqlx::query(&query);
-    for (i, param) in params.iter().enumerate() {
-        sql_query = sql_query.bind(param);
-    }
-    sql_query = sql_query.bind(user_id.into_inner());
-
-    match sql_query.execute(pool.get_ref()).await {
-        Ok(_) => {
-            println!("User patched successfully");
-            HttpResponse::Ok().finish()
-        },
-        Err(e) => {
-            println!("Database error: {}", e);
-            HttpResponse::InternalServerError().body(format!("Database error: {}", e))
-        }
-    }
-}
-
-async fn delete_user(
-    user_id: web::Path<i32>,  // Ganti TypeDataGet dengan Path<i32> untuk menerima ID dari URL
-    pool: web::Data<PgPool>
-) -> impl Responder {
-    let user_id = user_id.into_inner();
-    println!("Deleting user with ID: {}", user_id);
-
-    let query = "DELETE FROM users WHERE id = $1";
-
-    match sqlx::query(query)
-        .bind(user_id)
-        .execute(pool.get_ref())
-        .await {
-            Ok(_) => {
-                println!("User deleted successfully");
-                HttpResponse::Ok().body(format!("User with ID {} deleted", user_id))
-            },
-            Err(e) => {
-                println!("Database error: {}", e);
-                HttpResponse::InternalServerError().body(format!("Database error: {}", e))
-            },
-    }
+    pertanyaan: String,
+    jawaban: String,
+    status: String, 
+    provinsi: Option<String>,         // Added
+    kabupaten: Option<String>,        // Added
+    kecamatan: Option<String> 
 }
 
 #[derive(Deserialize)]
-struct VerifyOtp {
+struct NewUser {
+    nama_lengkap: String,
     email: String,
+    password: String,
+    tanggal_lahir: String,
+    umur: i32,
+    pekerjaan: String,
+    golongan_darah: String,
+    jenis_kelamin: String,
+    pertanyaan: String,
+    jawaban: String,
+    provinsi: Option<String>,         // Added
+    kabupaten: Option<String>,        // Added
+    kecamatan: Option<String> 
+}
+
+#[derive(Serialize)]
+struct Claims {
+    sub: String,
+    exp: usize,
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct LoginResponse {
+    email_verified: bool,
+    nama_lengkap: String,
+}
+
+#[derive(Deserialize)]
+struct ForgotPasswordRequest {
+    email: String,
+    pertanyaan: String,
+}
+
+#[derive(Deserialize)]
+struct ResetPasswordRequest {
+    email: String,
+    pertanyaan: String,
+    jawaban: String,
+    new_password: String,
+}
+
+
+#[derive(Deserialize)]
+struct VerifyRequest {
     otp: String,
 }
 
-async fn verify_user(
-    data: web::Json<VerifyOtp>,
-    pool: web::Data<PgPool>
-) -> impl Responder {
-    let email = &data.email;
-    let otp = &data.otp;
 
-    // Query to fetch the user's OTP and verification status from the database
-    let query = "SELECT otp, is_verified FROM users WHERE email = $1";
-    let result: Result<(String, bool), sqlx::Error> = sqlx::query_as(query)
-        .bind(email)
-        .fetch_one(pool.get_ref()).await;
+// Functions
+fn generate_otp() -> String {
+    let mut rng = rand::thread_rng();
+    (0..6)
+        .map(|_| rng.gen_range(0..10).to_string())
+        .collect()
+}
 
-    match result {
-        Ok((stored_otp, is_verified)) if stored_otp == *otp && !is_verified => {
-            // Update the is_verified field to true
-            let update_query = "UPDATE users SET is_verified = TRUE WHERE email = $1";
-            match sqlx::query(update_query)
-                .bind(email)
-                .execute(pool.get_ref()).await {
-                    Ok(_) => HttpResponse::Ok().body("user berhasil terverifikasi"),
-                    Err(e) => {
-                        println!("Database error: {}", e);
-                        HttpResponse::InternalServerError().body(format!("Database error: {}", e))
-                    }
-            }
-        },
-        Ok((_, true)) => HttpResponse::BadRequest().body("Already verified"),
-        _ => HttpResponse::BadRequest().body("Invalid OTP or email"),
+async fn fetch_umur_chart() -> impl Responder {
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    )
+    .await
+    .unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    match get_umur_chart(&client).await {
+        Ok(chart) => HttpResponse::Ok().json(chart),
+        Err(_) => HttpResponse::InternalServerError().finish(),
     }
 }
 
-async fn send_email(to: &str, subject: &str, body: &str) -> Result<(), lettre::transport::smtp::Error> {
+async fn get_umur_chart(client: &Client) -> Result<AgeCategory, Error> {
+    // Query for each umur category
+    let category_0_5 = client
+        .query_one("SELECT COUNT(*) FROM users WHERE umur BETWEEN 0 AND 5", &[])
+        .await?
+        .get(0);
+
+    let category_6_12 = client
+        .query_one("SELECT COUNT(*) FROM users WHERE umur BETWEEN 6 AND 12", &[])
+        .await?
+        .get(0);
+
+    let category_13_17 = client
+        .query_one("SELECT COUNT(*) FROM users WHERE umur BETWEEN 13 AND 17", &[])
+        .await?
+        .get(0);
+
+    let category_18_20 = client
+        .query_one("SELECT COUNT(*) FROM users WHERE umur BETWEEN 18 AND 20", &[])
+        .await?
+        .get(0);
+
+    let category_21_59 = client
+        .query_one("SELECT COUNT(*) FROM users WHERE umur BETWEEN 21 AND 59", &[])
+        .await?
+        .get(0);
+
+    let category_60_plus = client
+        .query_one("SELECT COUNT(*) FROM users WHERE umur >= 60", &[])
+        .await?
+        .get(0);
+
+    Ok(AgeCategory {
+        category_0_5,
+        category_6_12,
+        category_13_17,
+        category_18_20,
+        category_21_59,
+        category_60_plus,
+    })
+}
+
+
+async fn fetch_user_details() -> impl Responder {
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    )
+    .await
+    .unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    match get_user_details(&client).await {
+        Ok(details) => HttpResponse::Ok().json(details),
+        Err(_) => HttpResponse::InternalServerError().finish(),
+    }
+}
+  
+async fn get_user_details(client: &Client) -> Result<UserDetails, Error> {
+    // Query to count total users
+    let total_users = client
+        .query_one("SELECT COUNT(*) FROM users", &[])
+        .await?
+        .get(0);
+
+    // Query to count female users
+    let female = client
+        .query_one("SELECT COUNT(*) FROM users WHERE jenis_kelamin = 'Perempuan'", &[])
+        .await?
+        .get(0);
+
+    // Query to count male users
+    let male = client
+        .query_one("SELECT COUNT(*) FROM users WHERE jenis_kelamin = 'Laki-Laki'", &[])
+        .await?
+        .get(0);
+
+    Ok(UserDetails {
+        total_users,
+        male,
+        female,
+    })
+}
+
+// Fungsi untuk mengubah password dengan validasi email, pertanyaan, dan jawaban
+async fn change_password(data: web::Json<ResetPasswordRequest>) -> Result<HttpResponse, ActixError> {
+    let email = &data.email;
+    let pertanyaan = &data.pertanyaan;
+    let jawaban = &data.jawaban; // gunakan otp field untuk menyimpan jawaban
+    let new_password = &data.new_password;
+
+    let hashed_password = match hash(&new_password, DEFAULT_COST) {
+        Ok(hp) => hp,
+        Err(_) => return Ok(HttpResponse::InternalServerError().json("Error hashing password")),
+    };
+
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    ).await.unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    let statement = client.prepare("UPDATE users SET password = $1 WHERE email = $2 AND pertanyaan = $3 AND jawaban = $4").await.unwrap();
+    match client.execute(&statement, &[&hashed_password, &email, &pertanyaan, &jawaban]).await {
+        Ok(count) if count > 0 => Ok(HttpResponse::Ok().json("Password successfully changed")),
+        _ => Ok(HttpResponse::NotFound().json("Invalid email, question, or answer")),
+    }
+}
+
+async fn send_registration_email(email: &str, otp: &str) -> Result<(), Box<dyn std::error::Error>> {
     let email = Message::builder()
-        .from("eridayalma999@gmail.com".parse().unwrap())
-        .to(to.parse().unwrap()) // Use the provided recipient email
-        .subject(subject)
-        .body(body.to_string())
+        .from("eridayalma999@gmail.com".parse()?)
+        .to(email.parse()?)
+        .subject("Registration Confirmation")
+        .body(format!(
+            "Thank you for registering! Your OTP is: {}",
+            otp,
+        ))
         .unwrap();
 
-    let creds = Credentials::new(
-        String::from("eridayalma999@gmail.com"),
-        String::from("qqzjftjsxmlqxgul"), // Ensure this is the correct application-specific password
-    );
+    let creds = Credentials::new("eridayalma999@gmail.com".to_string(), "qqzjftjsxmlqxgul".to_string());
 
-    let mailer = SmtpTransport::relay("smtp.gmail.com")
-        .unwrap()
-        .port(465) // Port for SSL
+    let mailer = SmtpTransport::relay("smtp.gmail.com")?
         .credentials(creds)
         .build();
 
-    match mailer.send(&email) {
-        Ok(_) => {
-            println!("Email sent successfully to {}", to);
-            Ok(())
+    mailer.send(&email)?;
+
+    Ok(())
+}
+
+async fn forgot_password(data: web::Json<ForgotPasswordRequest>) -> Result<HttpResponse, ActixError> {
+    let email = &data.email;
+
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    ).await.unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Generate OTP or token
+    let otp = generate_otp(); // You can also use a token if preferred
+
+    let statement = client.prepare("UPDATE users SET reset_token = $1, otp = $2 WHERE email = $3").await.unwrap();
+    match client.execute(&statement, &[&Uuid::new_v4().to_string(), &otp, &email]).await {
+        Ok(count) if count > 0 => {
+            if let Err(e) = send_reset_password_email(email, &otp).await {
+                eprintln!("Error sending email: {}", e);
+            }
+            Ok(HttpResponse::Ok().json("Reset password email sent"))
         },
+        _ => Ok(HttpResponse::NotFound().json("Email not found")),
+    }
+}
+
+async fn send_reset_password_email(email: &str, otp: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let email = Message::builder()
+        .from("eridayalma999@gmail.com".parse()?)
+        .to(email.parse()?)
+        .subject("Password Reset Request")
+        .body(format!(
+            "You requested to reset your password. Your OTP is: {}",
+            otp,
+        ))
+        .unwrap();
+
+    let creds = Credentials::new("eridayalma999@gmail.com".to_string(), "qqzjftjsxmlqxgul".to_string());
+
+    let mailer = SmtpTransport::relay("smtp.gmail.com")?
+        .credentials(creds)
+        .build();
+
+    mailer.send(&email)?;
+
+    Ok(())
+}
+
+
+async fn get_users(client: &Client) -> Result<Vec<User>, Error> {
+    let mut users = Vec::new();
+
+    let rows = client.query(
+        "SELECT id, nama_lengkap, email, password, tanggal_lahir, umur, pekerjaan, golongan_darah, jenis_kelamin, pertanyaan, jawaban, status, provinsi, kabupaten, kecamatan
+        FROM users 
+        WHERE email_verified = TRUE", 
+        &[]
+    ).await?;
+
+    for row in rows {
+        let user = User {
+            id: row.get(0),
+            nama_lengkap: row.get(1),
+            email: row.get(2),
+            password: row.get(3),
+            tanggal_lahir: row.get(4),
+            umur: row.get(5),
+            pekerjaan: row.get(6),
+            golongan_darah: row.get(7),
+            jenis_kelamin: row.get(8),
+            pertanyaan: row.get(9),
+            jawaban: row.get(10),
+            status: row.get(11), // Add this line
+            provinsi: row.get(12),
+            kabupaten:row.get(13),
+            kecamatan: row.get(14)
+
+        };
+        users.push(user);
+    }
+
+    Ok(users)
+}
+
+
+async fn fetch_users() -> impl Responder {
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    ).await.unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    match get_users(&client).await {
+        Ok(users) => HttpResponse::Ok().json(users),
+        Err(_) => HttpResponse::InternalServerError().finish(),
+    }
+}
+
+async fn verify_otp(data: web::Json<VerifyRequest>) -> Result<HttpResponse, ActixError> {
+    let otp = &data.otp;
+
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    ).await.map_err(|e| {
+        eprintln!("Connection error: {}", e);
+        actix_web::error::ErrorInternalServerError("Database connection error")
+    })?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    let statement = client.prepare(
+        "UPDATE users 
+         SET email_verified = TRUE
+         WHERE otp = $1"
+    ).await.map_err(|e| {
+        eprintln!("Failed to prepare statement: {}", e);
+        actix_web::error::ErrorInternalServerError("Failed to prepare statement")
+    })?;
+
+    match client.execute(&statement, &[&otp]).await {
+        Ok(count) if count > 0 => Ok(HttpResponse::Ok().json(ResponseMessage {
+            message: "Email verified successfully".into(),
+        })),
+        Ok(_) => Ok(HttpResponse::NotFound().json(ResponseMessage {
+            message: "Invalid OTP".into(),
+        })),
         Err(e) => {
-            eprintln!("Failed to send email: {:?}", e);
-            Err(e)
+            eprintln!("Error executing query: {}", e);
+            Ok(HttpResponse::InternalServerError().json(ResponseMessage {
+                message: "Failed to verify OTP".into(),
+            }))
         }
     }
+}
+
+#[derive(Serialize)]
+struct BloodTypeCategory {
+    A: i64,
+    B: i64,
+    AB: i64,
+    O: i64,
+}
+
+async fn get_blood_type_chart(client: &Client) -> Result<BloodTypeCategory, Error> {
+    let A: i64 = client
+        .query_one("SELECT COUNT(*) FROM users WHERE golongan_darah = 'A'", &[])
+        .await?
+        .get(0);
+
+    let B: i64 = client
+        .query_one("SELECT COUNT(*) FROM users WHERE golongan_darah = 'B'", &[])
+        .await?
+        .get(0);
+
+    let AB: i64 = client
+        .query_one("SELECT COUNT(*) FROM users WHERE golongan_darah = 'AB'", &[])
+        .await?
+        .get(0);
+
+    let O: i64 = client
+        .query_one("SELECT COUNT(*) FROM users WHERE golongan_darah = 'O'", &[])
+        .await?
+        .get(0);
+
+
+    Ok(BloodTypeCategory {
+        A,
+        B,
+        AB,
+        O,
+    })
+}
+
+#[derive(Serialize)]
+struct GenderCategory {
+    perempuan: i64,
+    laki_laki: i64,
+}
+
+async fn get_gender_chart(client: &Client) -> Result<GenderCategory, tokio_postgres::Error> {
+    // Query untuk menghitung jumlah pengguna perempuan
+    let perempuan: i64 = client
+        .query_one("SELECT COUNT(*) FROM users WHERE jenis_kelamin = 'Perempuan'", &[])
+        .await?
+        .get(0);
+
+    // Query untuk menghitung jumlah pengguna laki-laki
+    let laki_laki: i64 = client
+        .query_one("SELECT COUNT(*) FROM users WHERE jenis_kelamin = 'Laki-laki'", &[])
+        .await?
+        .get(0);
+
+    Ok(GenderCategory {
+        perempuan,
+        laki_laki,
+    })
+}
+
+async fn fetch_gender_chart() -> impl Responder {
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    )
+    .await
+    .unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    match get_gender_chart(&client).await {
+        Ok(chart) => HttpResponse::Ok().json(chart),
+        Err(_) => HttpResponse::InternalServerError().finish(),
+    }
+}
+
+async fn fetch_blood_type_chart() -> impl Responder {
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    )
+    .await
+    .unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    match get_blood_type_chart(&client).await {
+        Ok(chart) => HttpResponse::Ok().json(chart),
+        Err(_) => HttpResponse::InternalServerError().finish(),
+    }
+}
+
+async fn insert_user(new_user: web::Json<NewUser>) -> Result<HttpResponse, ActixError> {
+    // Hash the password
+    let hashed_password = match hash(&new_user.password, DEFAULT_COST) {
+        Ok(hp) => hp,
+        Err(_) => return Ok(HttpResponse::InternalServerError().json("Error hashing password")),
+    };
+
+    // Generate verification token and OTP
+    let token: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(10)
+        .map(char::from)
+        .collect();
+    let otp = generate_otp(); // Generate OTP
+
+    // Establish the database connection
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    ).await.unwrap();
+
+    // Handle connection in the background
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Prepare and execute the SQL statement with the new fields
+    let statement = client.prepare(
+        "INSERT INTO users (nama_lengkap, email, password, tanggal_lahir, umur, pekerjaan, golongan_darah, jenis_kelamin, otp, token, pertanyaan, jawaban, provinsi, kabupaten, kecamatan) 
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) 
+        RETURNING id"
+    ).await.unwrap();
+
+    match client.query_one(
+        &statement, 
+        &[
+            &new_user.nama_lengkap, 
+            &new_user.email, 
+            &hashed_password, 
+            &new_user.tanggal_lahir, 
+            &new_user.umur, 
+            &new_user.pekerjaan, 
+            &new_user.golongan_darah, 
+            &new_user.jenis_kelamin, 
+            &otp, 
+            &token, 
+            &new_user.pertanyaan, 
+            &new_user.jawaban, 
+            &new_user.provinsi, 
+            &new_user.kabupaten, 
+            &new_user.kecamatan
+        ]
+    ).await {
+        Ok(row) => {
+            let user_id: i32 = row.get(0);
+            if let Err(e) = send_registration_email(&new_user.email, &otp).await {
+                eprintln!("Error sending email: {}", e);
+            }
+            Ok(HttpResponse::Created().json(format!("User successfully added with ID: {}", user_id)))
+        },
+        Err(e) => {
+            eprintln!("Error inserting user: {}", e);
+            Ok(HttpResponse::InternalServerError().json("Error adding user"))
+        },
+    }
+}
+
+
+async fn delete_user(user_id: web::Path<i32>) -> Result<HttpResponse, ActixError> {
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    ).await.unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    let statement = client.prepare("DELETE FROM users WHERE id = $1").await.unwrap();
+    match client.execute(&statement, &[&user_id.into_inner()]).await {
+        Ok(_) => Ok(HttpResponse::Ok().json("User successfully deleted")),
+        Err(e) => {
+            eprintln!("Error deleting user: {}", e);
+            Ok(HttpResponse::InternalServerError().json("Error deleting user"))
+        },
+    }
+}
+
+async fn update_user(
+    user_id: web::Path<i32>, 
+    updated_user: web::Json<NewUser>,
+) -> Result<HttpResponse, ActixError> {
+    // Hash the password
+    let hashed_password = match hash(&updated_user.password, DEFAULT_COST) {
+        Ok(hp) => hp,
+        Err(_) => return Ok(HttpResponse::InternalServerError().json("Error hashing password")),
+    };
+
+    // Establish the database connection
+    let (client, connection) = match tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    ).await {
+        Ok(conn) => conn,
+        Err(_) => return Ok(HttpResponse::InternalServerError().json("Database connection error")),
+    };
+
+    // Handle connection in the background
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Prepare and execute the SQL statement
+    let statement = match client.prepare(
+        "UPDATE users SET 
+            nama_lengkap = $1, 
+            password = $2, 
+            tanggal_lahir = $3,
+            umur = $4, 
+            pekerjaan = $5,
+            golongan_darah = $6
+            jenis_kelamin = $7, 
+            pertanyaan = $8,
+            jawaban = $9,
+            provinsi = $10, 
+            kabupaten = $11, 
+            kecamatan = $12
+        WHERE id = $13"
+    ).await {
+        Ok(stmt) => stmt,
+        Err(_) => return Ok(HttpResponse::InternalServerError().json("Error preparing SQL statement")),
+    };
+
+    match client.execute(
+        &statement, 
+        &[
+            &updated_user.nama_lengkap, 
+            &updated_user.email,
+            &hashed_password, 
+            &updated_user.tanggal_lahir,
+            &updated_user.umur, 
+            &updated_user.pekerjaan,
+            &updated_user.golongan_darah,
+            &updated_user.jenis_kelamin, 
+            &updated_user.pertanyaan,
+            &updated_user.jawaban,
+            &updated_user.provinsi, 
+            &updated_user.kabupaten, 
+            &updated_user.kecamatan, 
+            &user_id.into_inner(),
+        ]
+    ).await {
+        Ok(_) => Ok(HttpResponse::Ok().json("User successfully updated")),
+        Err(e) => {
+            eprintln!("Error updating user: {}", e);
+            Ok(HttpResponse::InternalServerError().json("Error updating user"))
+        },
+    }
+}
+
+
+async fn login(data: web::Json<LoginRequest>) -> Result<HttpResponse, actix_web::Error> {
+    let email = &data.email;
+    let password = &data.password;
+
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    ).await.unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    let statement = client.prepare("SELECT id, password, email_verified, nama_lengkap FROM users WHERE email = $1").await.unwrap();
+    let row = client.query_opt(&statement, &[&email]).await.unwrap();
+
+    if let Some(row) = row {
+        let user_id: i32 = row.get(0);
+        let stored_password: String = row.get(1);
+        let email_verified: bool = row.get(2);
+        let nama_lengkap: String = row.get(3); // Fetch the full name
+
+        if verify(password, &stored_password).unwrap() {
+            if email_verified {
+                // Generate token with length 10 characters
+                let token: String = rand::thread_rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(10)
+                    .map(char::from)
+                    .collect();
+
+                // Update token and status in the database
+                let update_status_statement = client.prepare("UPDATE users SET status = 'Online', token = $1 WHERE email = $2").await.unwrap();
+                client.execute(&update_status_statement, &[&token, &email]).await.unwrap();
+
+                return Ok(HttpResponse::Ok().json(LoginResponse {
+                    email_verified: true,
+                    nama_lengkap, // Include the full name in the response
+                }));
+            } else {
+                return Ok(HttpResponse::Unauthorized().json(ResponseMessage {
+                    message: "Email belum terverifikasi. Silakan cek email Anda untuk verifikasi.".into(),
+                }));
+            }
+        }
+    }
+
+    Ok(HttpResponse::Unauthorized().json(ResponseMessage {
+        message: "Email atau password salah.".into(),
+    }))
+}
+
+
+async fn logout(user_id: web::Path<i32>) -> Result<HttpResponse, ActixError> {
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    ).await.map_err(|e| {
+        eprintln!("Connection error: {}", e);
+        actix_web::error::ErrorInternalServerError("Database connection error")
+    })?;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Update status menjadi 'Offline' dan hapus token
+    let statement = client.prepare("UPDATE users SET token = NULL, status = 'Offline' WHERE id = $1").await.map_err(|e| {
+        eprintln!("Prepare statement error: {}", e);
+        actix_web::error::ErrorInternalServerError("Database statement preparation error")
+    })?;
+
+    client.execute(&statement, &[&*user_id]).await.map_err(|e| {
+        eprintln!("Execute statement error: {}", e);
+        actix_web::error::ErrorInternalServerError("Database execution error")
+    })?;
+
+    Ok(HttpResponse::Ok().json(ResponseMessage {
+        message: "Successfully logged out and status set to Offline".into(),
+    }))
+}
+
+#[derive(Serialize)]
+struct PekerjaanCategory {
+    name: String,
+    value: i64,
+}
+
+async fn get_pekerjaan_chart(client: &Client) -> Result<Vec<PekerjaanCategory>, Error> {
+    let pelajar = client
+        .query_one("SELECT COUNT(*) FROM users WHERE pekerjaan = 'Pelajar'", &[])
+        .await?
+        .get(0);
+
+    let mahasiswa = client
+        .query_one("SELECT COUNT(*) FROM users WHERE pekerjaan = 'Mahasiswa'", &[])
+        .await?
+        .get(0);
+
+    let pekerja = client
+        .query_one("SELECT COUNT(*) FROM users WHERE pekerjaan = 'Pekerja'", &[])
+        .await?
+        .get(0);
+
+    Ok(vec![
+        PekerjaanCategory { name: "Pelajar".to_string(), value: pelajar },
+        PekerjaanCategory { name: "Mahasiswa".to_string(), value: mahasiswa },
+        PekerjaanCategory { name: "Pekerja".to_string(), value: pekerja },
+    ])
+}
+
+async fn fetch_pekerjaan_chart() -> impl Responder {
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    )
+    .await
+    .unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    match get_pekerjaan_chart(&client).await {
+        Ok(chart) => HttpResponse::Ok().json(chart),
+        Err(_) => HttpResponse::InternalServerError().finish(),
+    }
+}
+
+#[derive(Serialize)]
+struct GenderData {
+    laki_laki: usize,
+    perempuan: usize,
+}
+
+// Fungsi umum untuk mengambil data gender berdasarkan field (provinsi, kabupaten, kecamatan)
+async fn get_gender_by_field(field: &str, value: &str) -> Result<GenderData, ActixError> {
+    // Koneksi ke database
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=postgres password=erida999 dbname=postgres",
+        NoTls,
+    ).await.map_err(|e| {
+        eprintln!("Database connection error: {}", e);
+        actix_web::error::ErrorInternalServerError("Database connection error")
+    })?;
+
+    // Jalankan koneksi di task terpisah
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    // Siapkan query dinamis berdasarkan field (provinsi, kabupaten, kecamatan)
+    let query = format!("SELECT jenis_kelamin, COUNT(*) FROM users WHERE {} = $1 GROUP BY jenis_kelamin", field);
+
+    // Eksekusi query
+    let statement = client.prepare(&query).await.map_err(|e| {
+        eprintln!("Failed to prepare SQL statement: {}", e);
+        actix_web::error::ErrorInternalServerError("Failed to prepare SQL statement")
+    })?;
+    
+    let rows = client.query(&statement, &[&value.to_string()]).await.map_err(|e| {
+        eprintln!("Failed to execute SQL query: {}", e);
+        actix_web::error::ErrorInternalServerError("Failed to execute SQL query")
+    })?;
+
+    // Proses hasil query
+    let mut gender_count = HashMap::new();
+    for row in rows {
+        let gender: String = row.get(0);
+        let count: i64 = row.get(1);
+        gender_count.insert(gender, count as usize);
+    }
+
+    // Ambil data gender dari hasil query
+    let laki_laki = gender_count.get("Laki-laki").cloned().unwrap_or(0);
+    let perempuan = gender_count.get("Perempuan").cloned().unwrap_or(0);
+
+    // Kembalikan hasilnya
+    Ok(GenderData { laki_laki, perempuan })
+}
+
+// Handler untuk mendapatkan data gender berdasarkan provinsi
+async fn get_gender_by_provinsi(provinsi: web::Path<String>) -> Result<HttpResponse, ActixError> {
+    let data = get_gender_by_field("provinsi", &provinsi).await?;
+    Ok(HttpResponse::Ok().json(data))
+}
+
+// Handler untuk mendapatkan data gender berdasarkan kabupaten
+async fn get_gender_by_kabupaten(kabupaten: web::Path<String>) -> Result<HttpResponse, ActixError> {
+    let data = get_gender_by_field("kabupaten", &kabupaten).await?;
+    Ok(HttpResponse::Ok().json(data))
+}
+
+// Handler untuk mendapatkan data gender berdasarkan kecamatan
+async fn get_gender_by_kecamatan(kecamatan: web::Path<String>) -> Result<HttpResponse, ActixError> {
+    let data = get_gender_by_field("kecamatan", &kecamatan).await?;
+    Ok(HttpResponse::Ok().json(data))
 }
 
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    dotenv().ok();
-
-
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    println!("Connecting to database at {}", database_url);
-    let pool = PgPool::connect(&database_url).await.expect("Failed to connect to database");
-
-    HttpServer::new(move || {
+    HttpServer::new(|| {
         App::new()
-            .app_data(web::Data::new(pool.clone()))
-            .route("/users", web::get().to(get_users))
-            .route("/users", web::post().to(post_users))
-            .route("/users/{id}", web::put().to(put_user))
-            .route("/users/{id}", web::patch().to(patch_user))
-            .route("/users/{id}", web::delete().to(delete_user))
-            .route("/verify_otp", web::post().to(verify_user))
-    })
+            .wrap(Cors::permissive()) // Add this line
+            .route("/users", web::get().to(fetch_users))
+            .route("/register", web::post().to(insert_user))
+            .route("/delete/{id}", web::delete().to(delete_user))
+            .route("/users/{id}", web::put().to(update_user))
+            .route("/verify_otp", web::post().to(verify_otp))
+            .route("/login", web::post().to(login))
+            .route("/logout/{user_id}", web::post().to(logout))
+            .route("/forgot_password", web::post().to(forgot_password))
+            .route("/change_password", web::post().to(change_password)) // Tambahkan endpoint baru untuk mengubah password
+            .route("/bloodtypechart", web::get().to(fetch_blood_type_chart))
+            .route("/genderchart", web::get().to(fetch_gender_chart))
+            .route("/occupationchart",web::get().to(fetch_pekerjaan_chart))
+            .route("/agechart", web::get().to(fetch_umur_chart)) // Menambahkan route baru
+            .route("/totaluser_gender", web::get().to(fetch_user_details)) 
+            .route("/gender/provinsi/{provinsi}", web::get().to(get_gender_by_provinsi))
+            .route("/gender/kabupaten/{kabupaten}", web::get().to(get_gender_by_kabupaten))
+            .route("/gender/kecamatan/{kecamatan}", web::get().to(get_gender_by_kecamatan)) // Menambahkan route baru
+    })  
     .bind("127.0.0.1:8080")?
     .run()
-    .await
+    .await  
 }
